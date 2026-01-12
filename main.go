@@ -10,6 +10,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions"
 )
 
 type Server struct {
@@ -18,21 +19,61 @@ type Server struct {
 }
 
 func NewServer() (*Server, error) {
-	subscriptionID := os.Getenv("AZURE_SUBSCRIPTION_ID")
-	if subscriptionID == "" {
-		return nil, fmt.Errorf("AZURE_SUBSCRIPTION_ID environment variable is required")
-	}
-
 	// Create a default Azure credential (supports Azure CLI, Managed Identity, etc.)
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create credential: %w", err)
 	}
 
+	subscriptionID := os.Getenv("AZURE_SUBSCRIPTION_ID")
+	if subscriptionID == "" {
+		// If not specified, get the default subscription
+		log.Println("AZURE_SUBSCRIPTION_ID not set, fetching default subscription...")
+		subscriptionID, err = getDefaultSubscription(cred)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get default subscription: %w", err)
+		}
+		log.Printf("Using default subscription: %s", subscriptionID)
+	}
+
 	return &Server{
 		subscriptionID: subscriptionID,
 		credential:     cred,
 	}, nil
+}
+
+func getDefaultSubscription(cred *azidentity.DefaultAzureCredential) (string, error) {
+	ctx := context.Background()
+	client, err := armsubscriptions.NewClient(cred, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create subscriptions client: %w", err)
+	}
+
+	// Get the first available subscription (typically the default)
+	pager := client.NewListPager(nil)
+	if pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to list subscriptions: %w", err)
+		}
+
+		if len(page.Value) > 0 {
+			// Find the default subscription (IsDefault == true) or use the first one
+			for _, sub := range page.Value {
+				if sub.State != nil && *sub.State == armsubscriptions.SubscriptionStateEnabled {
+					if sub.SubscriptionID != nil {
+						return *sub.SubscriptionID, nil
+					}
+				}
+			}
+			// Fallback to first subscription if no enabled one found
+			if page.Value[0].SubscriptionID != nil {
+				return *page.Value[0].SubscriptionID, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no subscriptions found")
 }
 
 func (s *Server) handleResourceGroups(w http.ResponseWriter, r *http.Request) {
