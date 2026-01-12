@@ -76,7 +76,124 @@ func getDefaultSubscription(cred *azidentity.DefaultAzureCredential) (string, er
 	return "", fmt.Errorf("no subscriptions found")
 }
 
+func (s *Server) handleResourceGroup(w http.ResponseWriter, r *http.Request, name string) {
+	ctx := context.Background()
+	client, err := armresources.NewResourceGroupsClient(s.subscriptionID, s.credential, nil)
+	if err != nil {
+		log.Printf("Failed to create resource groups client: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		// Get specific resource group
+		resp, err := client.Get(ctx, name, nil)
+		if err != nil {
+			log.Printf("Failed to get resource group: %v", err)
+			http.Error(w, "Resource group not found", http.StatusNotFound)
+			return
+		}
+
+		rgData := map[string]interface{}{
+			"name":     *resp.Name,
+			"location": *resp.Location,
+			"id":       *resp.ID,
+		}
+		if resp.Tags != nil {
+			rgData["tags"] = resp.Tags
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(rgData)
+
+	case http.MethodPut:
+		// Create or update resource group
+		var req struct {
+			Location string            `json:"location"`
+			Tags     map[string]string `json:"tags,omitempty"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if req.Location == "" {
+			http.Error(w, "location is required", http.StatusBadRequest)
+			return
+		}
+
+		// Convert tags to Azure format
+		var tags map[string]*string
+		if len(req.Tags) > 0 {
+			tags = make(map[string]*string)
+			for k, v := range req.Tags {
+				val := v
+				tags[k] = &val
+			}
+		}
+
+		params := armresources.ResourceGroup{
+			Location: &req.Location,
+			Tags:     tags,
+		}
+
+		resp, err := client.CreateOrUpdate(ctx, name, params, nil)
+		if err != nil {
+			log.Printf("Failed to create/update resource group: %v", err)
+			http.Error(w, "Failed to create resource group", http.StatusInternalServerError)
+			return
+		}
+
+		rgData := map[string]interface{}{
+			"name":     *resp.Name,
+			"location": *resp.Location,
+			"id":       *resp.ID,
+		}
+		if resp.Tags != nil {
+			rgData["tags"] = resp.Tags
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(rgData)
+
+	case http.MethodDelete:
+		// Delete resource group
+		poller, err := client.BeginDelete(ctx, name, nil)
+		if err != nil {
+			log.Printf("Failed to delete resource group: %v", err)
+			http.Error(w, "Failed to delete resource group", http.StatusInternalServerError)
+			return
+		}
+
+		// Wait for deletion to complete (optional - you could return immediately)
+		_, err = poller.PollUntilDone(ctx, nil)
+		if err != nil {
+			log.Printf("Failed to complete deletion: %v", err)
+			http.Error(w, "Failed to complete deletion", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) handleResourceGroups(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a request for a specific resource group
+	path := r.URL.Path
+	if len(path) > len("/resource-groups/") && path[:len("/resource-groups/")] == "/resource-groups/" {
+		// Extract resource group name from path
+		rgName := path[len("/resource-groups/"):]
+		s.handleResourceGroup(w, r, rgName)
+		return
+	}
+
+	// Handle list all resource groups
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -144,15 +261,18 @@ func main() {
 	}
 
 	// Setup routes
-	http.HandleFunc("/resource-groups", server.handleResourceGroups)
+	http.HandleFunc("/resource-groups/", server.handleResourceGroups)
 	http.HandleFunc("/health", server.handleHealth)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"message": "Azure Resource Groups API",
 			"endpoints": []string{
-				"/resource-groups - GET all resource groups",
-				"/health - Health check",
+				"GET /resource-groups - List all resource groups",
+				"GET /resource-groups/{name} - Get specific resource group",
+				"PUT /resource-groups/{name} - Create or update resource group",
+				"DELETE /resource-groups/{name} - Delete resource group",
+				"GET /health - Health check",
 			},
 		})
 	})
